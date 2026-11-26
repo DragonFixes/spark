@@ -87,6 +87,9 @@ subprojects {
 // zero and the build reports a version lower than the upstream release it is built on top of.
 def determinePatchVersion(String baseVersion) {
     def tagInfo = providers.exec {
+        // spark's own checkout, not the invoking build's: when spark is an included build of
+        // another project, the process working directory is that project's repository.
+        workingDir = rootDir
         commandLine 'git', 'describe', '--tags', '--match', 'v' + baseVersion
     }.standardOutput.asText.get().trim()
 

@@ -1,115 +1,98 @@
-<h1 align="center">spark (native memory fork)</h1>
+<h1 align="center">spark: native memory fork</h1>
 
-<h3 align="center">
-  A fork of <a href="https://github.com/lucko/spark">spark</a> that adds native memory and heap leak detection.
-</h3>
+<p align="center">
+  A drop-in fork of <a href="https://github.com/lucko/spark">spark</a> that finds
+  <b>native (off-heap)</b> and <b>Java heap</b> memory leaks.
+</p>
 
 ---
 
-## What this fork adds
+## Why
 
-Upstream spark profiles CPU time and Java allocation. It never looks at `malloc`, so
-off-heap memory is invisible to it — and that is where a large class of real Minecraft
-server memory problems live: zlib streams behind `Inflater`/`Deflater` that were never
-`end()`ed, Netty direct buffers never `release()`d, image codec state never `dispose()`d,
-memory allocated inside JNI libraries. The symptom is a server whose RSS climbs for days
-while the Java heap graph stays flat, and then gets OOM-killed.
+Upstream spark profiles CPU time and Java allocation, but it never sees `malloc`.
+That hides a whole class of server memory problems:
 
-This fork adds native memory leak detection and folds it together with Java heap leak
-detection into the existing profiler command.
+- `Inflater`/`Deflater` zlib streams that are never `end()`ed
+- Netty direct buffers that are never `release()`d
+- image codec state that is never `dispose()`d
+- memory allocated inside JNI libraries
+
+**Symptom:** RSS climbs for days, the Java heap graph stays flat, and then the
+server gets OOM-killed.
+
+## Usage
+
+Replace `spark.jar` with this jar. Commands, permissions and viewer links are the
+same as upstream.
 
 ```
 /spark profiler start --leaks --timeout 3600
 ```
 
-| Flag | What it adds |
-|---|---|
-| `--leaks` | both native and heap leak detection |
-| `--native-leaks` | off-heap only |
-| `--heap-leaks` | Java heap retention only |
+| Flag             | Detects                         |
+|------------------|---------------------------------|
+| `--leaks`        | native and Java heap leaks      |
+| `--native-leaks` | native (off-heap) leaks only    |
+| `--heap-leaks`   | Java heap retention only        |
 
-Everything else behaves exactly like upstream spark. Same command, same permissions,
-same viewer links. It is a drop-in replacement: remove `spark.jar`, add this jar.
+### Limits
+
+- **Linux or macOS only.** Leak detection needs async-profiler, and fails
+  loudly instead of returning a profile with no leak data.
+- **No window rotation.** A leak outlives the window it was made in, so leak
+  modes record one continuous window. They can't be combined with
+  `--only-ticks-over`.
+- **`mmap` is not tracked.** Metaspace, the JIT code cache, GC structures and
+  `MappedByteBuffer` are mostly invisible. For metaspace leaks from repeated
+  `/reload`, use NMT.
+- **Not all growth is a leak.** glibc arenas can hold 1 GB+ of RSS without
+  leaking, and Netty's pooled arenas grow to peak load and stay there. A
+  plateau is normal; steady growth is suspicious.
 
 ## How it works
 
-async-profiler's `event=` is single-valued, but `alloc=` and `nativemem=` are separate
-additive engines, so one recording can carry execution samples, live-object allocation
-samples and malloc/free events simultaneously. Verified against async-profiler 4.5: a
-single run of `event=wall,interval=10ms,alloc=512k,live,nativemem` produced
-`profiler.WallClockSample`, `profiler.Malloc`, `profiler.Free`, `profiler.LiveObject`
-and `jdk.ObjectAllocationInNewTLAB` in one JFR, with native leak totals matching a
-nativemem-only run of the same workload to within 4%.
+- One async-profiler recording carries execution samples, live-object
+  allocations and `malloc`/`free` events together (`alloc=` and `nativemem=`
+  run alongside `event=`).
+- A native leak is a `malloc` with no matching `free`. spark pairs them by
+  address in-process, matching `jfrconv --leak` totals byte for byte, with no
+  conversion tool needed on the server.
+- Allocations from the last 10% of the recording are dropped. They haven't had
+  a fair chance to be freed, and would bury a real slow leak in noise.
 
-A native leak is an allocation with no matching free. This fork correlates malloc
-against free by address in-process — the same approach as async-profiler's
-`jfrconv --leak`, but built in, so no conversion tool is needed on the server. Verified
-against a real JFR it produces byte-identical totals to `jfrconv --leak`.
-
-Allocations in the final 10% of the recording are discarded: they have not had a fair
-chance to be freed yet, and without that correction a genuine slow leak is buried under
-normal short-lived allocation.
-
-## Things to know
-
-**Window rotation is disabled during leak detection.** A leak is by definition an
-allocation that outlives the window it was made in, so spark's usual 60-second rotation
-would report almost everything as leaked while losing the long-lived allocations that
-matter. Consequence: `--leaks` cannot be combined with `--only-ticks-over`, and says so
-rather than producing wrong data.
-
-**Leak detection requires async-profiler**, so Linux or macOS, not Windows. It fails
-loudly rather than handing back a profile with no leak data in it.
-
-**`nativemem` intercepts `malloc`/`realloc`/`calloc`/`free`, but not `mmap`.** Metaspace,
-the JIT code cache, GC structures and `MappedByteBuffer` are largely invisible. For a
-suspected classloader/metaspace leak from repeated `/reload`, use NMT instead.
-
-**Not all native growth is a plugin's fault.** glibc arena retention can show over a
-gigabyte of RSS with no leak at all, and Netty's pooled arenas grow to peak load and
-stay there by design. A plateau is normal; monotonic growth is suspicious.
-
-## Data format
-
-Profiles keep the standard `application/x-spark-sampler` content type, so links still
-open in the normal spark viewer — which renders the CPU profile and silently ignores the
-leak data it doesn't know about (proto3 ignores unknown fields). Reading the leak data
-needs a consumer that understands the extended schema; field numbers are in `CHANGES.md`.
+Profiles keep the `application/x-spark-sampler` content type, so links open in
+the normal spark viewer. It shows the CPU profile and ignores the leak data.
+Reading the leak data needs a consumer that knows the extended schema; field
+numbers are in [`CHANGES.md`](CHANGES.md).
 
 ## Building
 
+Requires JDK 21.
+
 ```bash
-./gradlew :spark-bukkit:build      # Bukkit/Paper plugin
+./gradlew :spark-bukkit:build      # Bukkit / Paper plugin
 ./gradlew :spark-velocity:build    # Velocity plugin
 ./gradlew :spark-geyser:build      # Geyser extension
 ```
 
-Requires JDK 21. For Bukkit the output is `spark-<version>-bukkit.jar` — **use the
-bukkit jar**, on Paper too. The `spark-paper` module is the library Paper bundles
-inside the server jar and has no `plugin.yml`; it is not a drop-in plugin.
+- **Bukkit and Paper:** use `spark-<version>-bukkit.jar`. The `spark-paper`
+  module is the library Paper bundles in its server jar; it has no `plugin.yml`
+  and is not a plugin.
+- **Geyser:** `spark-<version>-geyser.jar` is a Geyser extension; put it in
+  Geyser's `extensions/` folder. It works on Geyser Standalone and on Geyser
+  running as a plugin or mod. Requires Geyser API 2.9.0+.
+  - `/spark tps` reports nothing, since Geyser has no tick loop. Everything
+    else works, including all three leak modes.
+  - The warning that the extension *"loads class one.profiler.Recording from an
+    external source"* is expected: that class is async-profiler's JNI helper.
 
-### Geyser
+## License
 
-`spark-<version>-geyser.jar` is a **Geyser extension**, not a plugin — drop it in
-Geyser's `extensions/` folder. It works on Geyser Standalone as well as Geyser running
-as a plugin/mod on another platform, and on Standalone it is the only way to profile
-the Geyser process from the inside.
+**GPL-3.0-or-later**, same as spark. Original copyright notices are intact, and
+[`CHANGES.md`](CHANGES.md) lists every modification (GPLv3 §5(a)).
+spark is itself a fork of [WarmRoast](https://github.com/sk89q/WarmRoast) by
+sk89q (GPLv3). The bundled async-profiler is Apache-2.0.
 
-Commands are namespaced under Geyser's extension root, so it is `/spark profiler start
---leaks` exactly as elsewhere. Geyser has no tick loop, so `/spark tps` reports nothing
-(as on Velocity and BungeeCord); everything else, including all three leak modes, works.
-
-Requires Geyser API 2.9.0+ (built against 2.11.1). Geyser logs a warning that the
-extension "loads class one.profiler.Recording from an external source" — that is
-async-profiler's JNI helper being loaded by spark, and is expected.
-
-## Licence
-
-**GPL-3.0-or-later**, same as spark — this cannot be relicensed. Original copyright
-notices are intact. `CHANGES.md` lists every modification, as GPLv3 §5(a) requires.
-
-spark is itself a fork of [WarmRoast](https://github.com/sk89q/WarmRoast) by sk89q, also
-GPLv3. Bundled async-profiler is Apache-2.0.
-
-Not affiliated with or endorsed by lucko. Please don't report this fork's bugs to the
-spark issue tracker. Upstream's README is preserved as `README.spark.md`.
+Not affiliated with or endorsed by lucko. Report this fork's bugs here, not on
+the spark issue tracker. Upstream's README is kept as
+[`README.spark.md`](README.spark.md).
